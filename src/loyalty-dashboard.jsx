@@ -42,6 +42,38 @@ const TEAL = "#1CC7B0";
 const TEAL_SOFT = "#17A896";
 const BLUE = "#3E6BE0";
 
+// Keeps a customer signed in across page reloads (a customer app that
+// re-asks for a phone/email OTP every refresh is a bad experience).
+// We only ever store the customer id locally — points and profile info are
+// always re-fetched fresh from Supabase on load, never trusted from cache.
+const CUSTOMER_SESSION_KEY = "perch_customer_session";
+
+function saveCustomerSession(customerId) {
+  try {
+    localStorage.setItem(CUSTOMER_SESSION_KEY, JSON.stringify({ id: customerId, ts: Date.now() }));
+  } catch (err) {
+    console.error("Failed to persist customer session:", err);
+  }
+}
+
+function loadCustomerSession() {
+  try {
+    const raw = localStorage.getItem(CUSTOMER_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.error("Failed to read customer session:", err);
+    return null;
+  }
+}
+
+function clearCustomerSession() {
+  try {
+    localStorage.removeItem(CUSTOMER_SESSION_KEY);
+  } catch (err) {
+    console.error("Failed to clear customer session:", err);
+  }
+}
+
 const THEME = {
   light: {
     sidebar: NAVY,
@@ -182,6 +214,27 @@ function TierBadge({ tier }) {
   );
 }
 
+// Tiled diagonal watermark shown on the balance card when the owner sets
+// cardStyle to "premium" in the owner dashboard's Branding tab. Pure SVG so
+// it stays crisp at any card size.
+function CardWatermark({ text, opacity = 0.16 }) {
+  const label = (text || "").trim().toUpperCase();
+  if (!label) return null;
+  const patternId = `wm-${label.replace(/[^A-Z0-9]/g, "") || "brand"}`;
+  return (
+    <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ opacity }} aria-hidden="true">
+      <defs>
+        <pattern id={patternId} width="150" height="64" patternTransform="rotate(-24)" patternUnits="userSpaceOnUse">
+          <text x="0" y="40" fontSize="15" fontWeight="800" letterSpacing="2" fill="#fff">
+            {label}
+          </text>
+        </pattern>
+      </defs>
+      <rect width="100%" height="100%" fill={`url(#${patternId})`} />
+    </svg>
+  );
+}
+
 function PoweredByPerch({ visible }) {
   if (visible === false) return null;
   return <p className="text-center text-[10px] tracking-wide opacity-40 mt-4">Powered by Perch</p>;
@@ -255,7 +308,7 @@ const DEMO_CUSTOMER = {
 function CustomerApp({ brand }) {
   const { mode: themeMode, setMode: setThemeMode, t } = useTheme();
 
-  const [step, setStep] = useState("auth");
+  const [step, setStep] = useState(() => (loadCustomerSession() ? "restoring" : "auth"));
   const [authLoading, setAuthLoading] = useState(false);
   const [points, setPoints] = useState(245);
   const [mode, setModeState] = useState("earn");
@@ -282,6 +335,41 @@ function CustomerApp({ brand }) {
   const [qrMode, setQrMode] = useState("show");
 
   const [rewards, setRewards] = useState(rewardsCatalog);
+
+  // Restore a signed-in customer after a page reload. Only the id is ever
+  // trusted from localStorage — name/points/etc. are always re-fetched fresh
+  // from Supabase so stale or tampered local data can't be displayed.
+  useEffect(() => {
+    async function restoreSession() {
+      const session = loadCustomerSession();
+      if (!session?.id) return;
+
+      const { data, error } = await supabase
+        .from("customers")
+        .select("*")
+        .eq("id", session.id)
+        .single();
+
+      if (error || !data) {
+        console.error("Failed to restore customer session:", error);
+        clearCustomerSession();
+        setStep("auth");
+        return;
+      }
+
+      setCustomer({
+        id: data.id,
+        name: data.name,
+        email: data.email,
+        phone: data.phone,
+        memberId: data.id.slice(0, 8),
+        joined: new Date(data.created_at).toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" }),
+      });
+      setPoints(data.points ?? 0);
+      setStep("home");
+    }
+    restoreSession();
+  }, []);
 
   useEffect(() => {
     async function loadRewards() {
@@ -317,6 +405,8 @@ function CustomerApp({ brand }) {
           secondary: data.secondary_color,
           logoUrl: data.logo_url,
           poweredBy: data.powered_by,
+          cardStyle: data.card_style,
+          watermarkText: data.watermark_text,
         });
       }
     }
@@ -333,6 +423,8 @@ function CustomerApp({ brand }) {
       primary: merged?.primary || t.accent,
       secondary: merged?.secondary || t.blue,
       name: merged?.name || "Loyalty Rewards",
+      cardStyle: merged?.cardStyle || "standard",
+      watermarkText: merged?.watermarkText || merged?.name || "Loyalty Rewards",
     };
   }, [brand, dbBrand, t]);
 
@@ -413,6 +505,7 @@ async function finishRegistration() {
     joined: new Date(data.created_at).toLocaleDateString("en-US", { day: "2-digit", month: "short", year: "numeric" }),
   });
   setPoints(data.points ?? 0);
+  saveCustomerSession(data.id);
   goAuth("home");
 }
   function generateCode() {
@@ -524,6 +617,7 @@ async function finishRegistration() {
   }
 
   function handleLogout() {
+    clearCustomerSession();
     setAccountOpen(false);
     setNotifOpen(false);
     setAppearanceOpen(false);
@@ -585,6 +679,13 @@ async function finishRegistration() {
   font-weight: 700;
 }
       `}</style>
+
+      {/* ==================== RESTORING SESSION ==================== */}
+      {step === "restoring" && (
+        <div className="flex-1 flex flex-col items-center justify-center px-7">
+          <div className="w-8 h-8 rounded-full border-2 animate-spin" style={{ borderColor: t.gridLine, borderTopColor: t.accent }} />
+        </div>
+      )}
 
       {/* ==================== AUTH: METHOD CHOICE ==================== */}
       {step === "auth" && (
@@ -888,6 +989,7 @@ async function finishRegistration() {
             >
               <div className="absolute -top-10 -right-10 w-40 h-40 rounded-full bg-white/10 pointer-events-none" />
               <div className="absolute -bottom-14 -left-6 w-32 h-32 rounded-full bg-white/5 pointer-events-none" />
+              {activeBrand.cardStyle === "premium" && <CardWatermark text={activeBrand.watermarkText} />}
               <div className="relative">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-bold uppercase tracking-wider opacity-90">Your balance</span>
