@@ -310,6 +310,7 @@ function CustomerApp({ brand }) {
 
   const [step, setStep] = useState(() => (loadCustomerSession() ? "restoring" : "auth"));
   const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [points, setPoints] = useState(245);
   const [mode, setModeState] = useState("earn");
   const [reward, setReward] = useState(null);
@@ -485,14 +486,51 @@ async function finishRegistration() {
     phone: authMethod === "phone" ? phoneInput.trim() || null : emailPhoneInput.trim() || null,
   };
 
-  const { data, error } = await supabase
-    .from("customers")
-    .insert([payload])
-    .select()
-    .single();
+  setAuthLoading(true);
+  setAuthError("");
+
+  // Look up an existing customer by phone/email first, so someone who logs
+  // out (or clears storage) and re-registers doesn't end up with a
+  // duplicate account whose points reset to 0.
+  let existing = null;
+  if (payload.phone || payload.email) {
+    const orParts = [];
+    if (payload.phone) orParts.push(`phone.eq."${payload.phone}"`);
+    if (payload.email) orParts.push(`email.eq."${payload.email}"`);
+
+    const { data: found, error: lookupError } = await supabase
+      .from("customers")
+      .select("*")
+      .or(orParts.join(","))
+      .limit(1)
+      .maybeSingle();
+
+    if (lookupError) {
+      console.error("Supabase lookup failed:", lookupError);
+      setAuthError(`Couldn't check for an existing account (${lookupError.message}). Check Supabase RLS policies allow anon SELECT on "customers".`);
+      setAuthLoading(false);
+      return;
+    }
+    existing = found;
+  }
+
+  let data, error;
+  if (existing) {
+    // Existing customer found — sign them in instead of creating a duplicate.
+    data = existing;
+    error = null;
+  } else {
+    ({ data, error } = await supabase
+      .from("customers")
+      .insert([payload])
+      .select()
+      .single());
+  }
 
   if (error) {
     console.error("Supabase insert failed:", error);
+    setAuthError(`Couldn't create your account (${error.message}). Check Supabase RLS policies allow anon INSERT on "customers".`);
+    setAuthLoading(false);
     return;
   }
 
@@ -506,6 +544,7 @@ async function finishRegistration() {
   });
   setPoints(data.points ?? 0);
   saveCustomerSession(data.id);
+  setAuthLoading(false);
   goAuth("home");
 }
   function generateCode() {
@@ -618,6 +657,9 @@ async function finishRegistration() {
 
   function handleLogout() {
     clearCustomerSession();
+    setCustomer(DEMO_CUSTOMER);
+    setPoints(0);
+    setAuthError("");
     setAccountOpen(false);
     setNotifOpen(false);
     setAppearanceOpen(false);
@@ -822,6 +864,11 @@ async function finishRegistration() {
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-5"
             style={{ background: t.chip, color: t.textPrimary, border: `1px solid ${t.cardBorder}` }}
           />
+          {authError && (
+            <p className="text-xs mb-3" style={{ color: t.danger || "#e5484d" }}>
+              {authError}
+            </p>
+          )}
           <Button
             variant="primary"
             accent={activeBrand.primary}
@@ -918,6 +965,11 @@ async function finishRegistration() {
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-5"
             style={{ background: t.chip, color: t.textPrimary, border: `1px solid ${t.cardBorder}` }}
           />
+          {authError && (
+            <p className="text-xs mb-3" style={{ color: t.danger || "#e5484d" }}>
+              {authError}
+            </p>
+          )}
           <Button
             variant="primary"
             accent={activeBrand.primary}
