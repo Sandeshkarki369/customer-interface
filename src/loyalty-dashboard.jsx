@@ -187,19 +187,20 @@ function PoweredByPerch({ visible }) {
   return <p className="text-center text-[10px] tracking-wide opacity-40 mt-4">Powered by Perch</p>;
 }
 
-function VerifyCode({ brand, mode, reward, onApprove, onBack }) {
+function VerifyCode({ brand, mode, reward, code, onCancel }) {
   return (
     <div className="flex-1 flex flex-col items-center justify-center px-7 text-center animate-fade-in-up">
       <div className="w-16 h-16 rounded-full flex items-center justify-center mb-5" style={{ backgroundColor: `${brand.primary}18` }}>
         <KeyRound size={26} style={{ color: brand.primary }} />
       </div>
       <h1 className="font-display text-xl mb-2 tracking-tight">{mode === "redeem" ? `Redeem ${reward?.name || "reward"}` : "Verify to earn points"}</h1>
-      <p className="text-sm mb-7 opacity-60 max-w-[240px]">Show this code to staff and have them confirm it on their device.</p>
-      <div className="text-3xl font-mono-data tracking-[0.3em] mb-9">482913</div>
-      <Button variant="primary" accent={brand.primary} size="lg" className="w-full mb-3" onClick={onApprove}>
-        Approve
-      </Button>
-      <Button variant="ghost" size="md" className="w-full" onClick={onBack}>
+      <p className="text-sm mb-7 opacity-60 max-w-[240px]">Show this code to staff — only they can confirm it at the counter.</p>
+      <div className="text-3xl font-mono-data tracking-[0.3em] mb-7">{code}</div>
+      <div className="flex items-center gap-2 mb-9 text-xs opacity-60">
+        <span className="w-2 h-2 rounded-full animate-pulse" style={{ background: brand.primary }} />
+        Waiting for staff to confirm…
+      </div>
+      <Button variant="ghost" size="md" className="w-full" onClick={onCancel}>
         Cancel
       </Button>
     </div>
@@ -260,6 +261,8 @@ function CustomerApp({ brand }) {
   const [mode, setModeState] = useState("earn");
   const [reward, setReward] = useState(null);
   const [lastGain, setLastGain] = useState(0);
+  const [pendingRequestId, setPendingRequestId] = useState(null);
+  const [pendingCode, setPendingCode] = useState("");
 
   // Auth / registration state
   const [authMethod, setAuthMethod] = useState(null); // "phone" | "email"
@@ -273,6 +276,7 @@ function CustomerApp({ brand }) {
   // Menu States
   const [accountOpen, setAccountOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
 
   const [scannerOpen, setScannerOpen] = useState(false);
   const [qrMode, setQrMode] = useState("show");
@@ -343,6 +347,12 @@ function CustomerApp({ brand }) {
     ? Math.min(100, Math.round(((points - tierInfo.floor) / (tierInfo.ceil - tierInfo.floor)) * 100))
     : 100;
 
+  // Cheapest reward the customer hasn't unlocked yet — shown as a quick, concrete goal
+  const nextReward = useMemo(() => {
+    const locked = rewards.filter((r) => r.cost > points).sort((a, b) => a.cost - b.cost);
+    return locked[0] || null;
+  }, [rewards, points]);
+
   const monthLabel = useMemo(() => new Date().toLocaleString("en-US", { month: "long", year: "numeric" }), []);
 
   const leaderboard = useMemo(() => {
@@ -405,41 +415,107 @@ async function finishRegistration() {
   setPoints(data.points ?? 0);
   goAuth("home");
 }
-  function startEarn() {
+  function generateCode() {
+    return String(Math.floor(100000 + Math.random() * 900000));
+  }
+
+  // Customer can only ever CREATE a pending request. Staff on the owner
+  // dashboard must confirm it (updating `pending_actions.status` to
+  // "approved") before any points move — the customer app never writes to
+  // `points` directly. This closes the loophole where a customer could tap
+  // "Approve" on their own device.
+  async function startEarn() {
+    const code = generateCode();
     setModeState("earn");
     setReward(null);
+    setPendingCode(code);
     setStep("verify");
+
+    const { data, error } = await supabase
+      .from("pending_actions")
+      .insert([{ customer_id: customer.id, type: "earn", reward_id: null, code, status: "pending" }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Failed to create pending earn request:", error);
+      return;
+    }
+    setPendingRequestId(data.id);
   }
 
-  function startRedeem(selectedReward) {
+  async function startRedeem(selectedReward) {
+    const code = generateCode();
     setModeState("redeem");
     setReward(selectedReward);
+    setPendingCode(code);
     setStep("verify");
+
+    const { data, error } = await supabase
+      .from("pending_actions")
+      .insert([{ customer_id: customer.id, type: "redeem", reward_id: selectedReward.id, code, status: "pending" }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Failed to create pending redeem request:", error);
+      return;
+    }
+    setPendingRequestId(data.id);
   }
 
-async function approve() {
-  const delta = mode === "earn" ? 18 : -(reward?.cost || 0);
-  const type = mode === "earn" ? "earn" : "redeem";
-  const label = mode === "earn" ? "Earned points" : `Redeemed ${reward?.name}`;
+  // Poll the pending request while the customer is on the "verify" screen.
+  // Only a staff-side action (owner dashboard) can flip status to "approved".
+  useEffect(() => {
+    if (step !== "verify" || !pendingRequestId) return;
 
-  const { error: activityError } = await supabase
-    .from("activity")
-    .insert([{ customer_id: customer.id, type, points_delta: delta, label }]);
+    const interval = setInterval(async () => {
+      const { data, error } = await supabase
+        .from("pending_actions")
+        .select("*")
+        .eq("id", pendingRequestId)
+        .single();
 
-  const newPoints = points + delta;
-  const { error: updateError } = await supabase
-    .from("customers")
-    .update({ points: newPoints })
-    .eq("id", customer.id);
+      if (error) {
+        console.error("Failed to poll pending request:", error);
+        return;
+      }
 
-  if (activityError || updateError) {
-    console.error("Approve failed:", activityError || updateError);
+      if (data?.status === "approved") {
+        clearInterval(interval);
+        const { data: customerRow, error: customerError } = await supabase
+          .from("customers")
+          .select("points")
+          .eq("id", customer.id)
+          .single();
+
+        if (customerError) {
+          console.error("Failed to refresh points after approval:", customerError);
+          return;
+        }
+
+        setLastGain((customerRow.points ?? points) - points);
+        setPoints(customerRow.points ?? points);
+        setPendingRequestId(null);
+        setStep("approved");
+      } else if (data?.status === "declined") {
+        clearInterval(interval);
+        setPendingRequestId(null);
+        setStep("home");
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [step, pendingRequestId, customer.id, points]);
+
+  async function cancelVerify() {
+    if (pendingRequestId) {
+      const { error } = await supabase.from("pending_actions").update({ status: "cancelled" }).eq("id", pendingRequestId);
+      if (error) console.error("Failed to cancel pending request:", error);
+    }
+    setPendingRequestId(null);
+    setStep("home");
   }
-
-  setLastGain(delta);
-  setPoints(newPoints);
-  setStep("approved");
-}
 
   function toggleQrMenu() {
     setAccountOpen(false);
@@ -450,8 +526,11 @@ async function approve() {
   function handleLogout() {
     setAccountOpen(false);
     setNotifOpen(false);
+    setAppearanceOpen(false);
     setScannerOpen(false);
     setReward(null);
+    setPendingRequestId(null);
+    setPendingCode("");
     setModeState("earn");
     setLastGain(0);
     setAuthMethod(null);
@@ -463,7 +542,7 @@ async function approve() {
     setStep("auth");
   }
 
-  const isAuthStep = ["auth", "phone_number", "phone_otp", "phone_name", "email_input", "email_otp", "email_name"].includes(step);
+  const isAuthStep = ["auth", "phone_number", "phone_verify", "email_input", "email_verify"].includes(step);
   const ICONS = { Coffee, Percent, Cookie, UtensilsCrossed };
 
   return (
@@ -509,44 +588,62 @@ async function approve() {
 
       {/* ==================== AUTH: METHOD CHOICE ==================== */}
       {step === "auth" && (
-        <div className="flex-1 flex flex-col px-6 py-8 animate-fade-in-up justify-center">
-          <div className="flex flex-col items-center mb-9">
-            <Logomark color={t.textSecondary} />
-            <h1 className="font-display text-3xl font-extrabold mt-3 tracking-tight" style={{ color: t.textPrimary }}>
-              {activeBrand.name}
-            </h1>
-            <p className="text-sm mt-1" style={{ color: t.textSecondary }}>
-              Sign in to see your rewards
-            </p>
+        <div className="flex-1 flex flex-col relative overflow-hidden animate-fade-in-up">
+          {/* Decorative brand-colored glow, echoes the balance card gradient elsewhere in the app */}
+          <div
+            className="absolute -top-24 left-1/2 -translate-x-1/2 w-72 h-72 rounded-full pointer-events-none opacity-25 blur-3xl"
+            style={{ background: `linear-gradient(135deg, ${activeBrand.secondary}, ${activeBrand.primary})` }}
+          />
+
+          <div className="flex-1 flex flex-col items-center justify-center px-6 relative">
+            <div className="w-full max-w-sm mx-auto flex flex-col items-center">
+              {activeBrand.logoUrl ? (
+                <img src={activeBrand.logoUrl} alt="" className="w-16 h-16 rounded-2xl object-cover shadow-soft-lg mb-5" />
+              ) : (
+                <div
+                  className="w-16 h-16 rounded-2xl flex items-center justify-center shadow-soft-lg mb-5"
+                  style={{ background: `linear-gradient(135deg, ${activeBrand.secondary}, ${activeBrand.primary})` }}
+                >
+                  <Coffee size={26} className="text-white" />
+                </div>
+              )}
+
+              <h1 className="font-display text-3xl font-extrabold tracking-tight text-center" style={{ color: t.textPrimary }}>
+                {activeBrand.name}
+              </h1>
+              <p className="text-sm mt-1.5 mb-10 text-center" style={{ color: t.textSecondary }}>
+                Sign in to earn points and unlock rewards
+              </p>
+
+              <div className="flex flex-col gap-3 w-full">
+                <button
+                  onClick={() => chooseAuthMethod("phone")}
+                  disabled={authLoading}
+                  className={`flex items-center gap-3 rounded-2xl px-4 py-4 text-sm font-semibold transition-all duration-200 active:scale-95 disabled:opacity-50 shadow-soft-lg ${themeMode === "glass" ? "glass-active" : ""}`}
+                  style={themeMode === "glass" ? { color: "#fff" } : { background: activeBrand.primary, color: "#fff" }}
+                >
+                  <span className="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style={{ background: "rgba(255,255,255,0.2)" }}>
+                    <Phone size={14} />
+                  </span>
+                  Continue with phone number
+                </button>
+
+                <button
+                  onClick={() => chooseAuthMethod("email")}
+                  disabled={authLoading}
+                  className={`flex items-center gap-3 rounded-2xl px-4 py-4 text-sm font-semibold transition-all duration-200 active:scale-95 disabled:opacity-50 ${themeMode === "glass" ? "glass-active" : ""}`}
+                  style={themeMode === "glass" ? { color: t.textPrimary } : { border: `1.5px solid ${t.cardBorder}`, color: t.textPrimary, background: t.cardBg }}
+                >
+                  <span className="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style={{ background: t.chip }}>
+                    <Mail size={14} style={{ color: t.textSecondary }} />
+                  </span>
+                  Continue with email
+                </button>
+              </div>
+            </div>
           </div>
 
-          <div className="flex flex-col gap-3">
-            <button
-              onClick={() => chooseAuthMethod("email")}
-              disabled={authLoading}
-              className={`flex items-center gap-3 rounded-full px-4 py-3.5 text-sm font-medium transition-all duration-200 active:scale-95 disabled:opacity-50 ${themeMode === "glass" ? "glass-active" : ""}`}
-              style={themeMode === "glass" ? { color: t.textPrimary } : { border: `1px solid ${t.cardBorder}`, color: t.textPrimary, background: t.cardBg }}
-            >
-              <span className="w-5 h-5 rounded-full flex items-center justify-center shrink-0" style={{ background: t.chip }}>
-                <Mail size={11} style={{ color: t.textSecondary }} />
-              </span>
-              Continue with email
-            </button>
-
-            <button
-              onClick={() => chooseAuthMethod("phone")}
-              disabled={authLoading}
-              className={`flex items-center gap-3 rounded-full px-4 py-3.5 text-sm font-medium transition-all duration-200 active:scale-95 disabled:opacity-50 ${themeMode === "glass" ? "glass-active" : ""}`}
-              style={themeMode === "glass" ? { color: t.textPrimary } : { border: `1px solid ${t.cardBorder}`, color: t.textPrimary, background: t.cardBg }}
-            >
-              <span className="w-5 h-5 rounded-full flex items-center justify-center relative shrink-0" style={{ background: t.chip }}>
-                <Phone size={11} style={{ color: t.textSecondary }} />
-              </span>
-              Continue with phone number
-            </button>
-          </div>
-
-          <div className="mt-auto">
+          <div className="pb-6">
             <PoweredByPerch visible={activeBrand.poweredBy} />
           </div>
         </div>
@@ -569,7 +666,7 @@ async function approve() {
             value={phoneInput}
             onChange={(e) => setPhoneInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && phoneInput.trim()) goAuth("phone_otp", () => phoneInput.trim().length > 0);
+              if (e.key === "Enter" && !authLoading && phoneInput.trim()) goAuth("phone_verify", () => phoneInput.trim().length > 0);
             }}
             placeholder="+977 98XXXXXXXX"
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-5 font-mono-data"
@@ -581,22 +678,22 @@ async function approve() {
             size="lg"
             className="w-full"
             disabled={authLoading || !phoneInput.trim()}
-            onClick={() => goAuth("phone_otp", () => phoneInput.trim().length > 0)}
+            onClick={() => goAuth("phone_verify", () => phoneInput.trim().length > 0)}
           >
             {authLoading ? "Sending code…" : "Send code"}
           </Button>
         </AuthScreen>
       )}
 
-      {/* ==================== AUTH: PHONE OTP ==================== */}
-      {step === "phone_otp" && (
+      {/* ==================== AUTH: PHONE VERIFY (code + name combined) ==================== */}
+      {step === "phone_verify" && (
         <AuthScreen
           t={t}
           themeMode={themeMode}
           onBack={() => setStep("phone_number")}
           icon={<KeyRound size={22} style={{ color: activeBrand.primary }} />}
-          title="Enter the code"
-          subtitle={`We sent a 4-digit code to ${phoneInput || "your phone"}.`}
+          title="Almost there"
+          subtitle={`Enter the 4-digit code we sent to ${phoneInput || "your phone"}, and tell us your name.`}
         >
           <input
             type="text"
@@ -606,42 +703,19 @@ async function approve() {
             value={otpInput}
             onChange={(e) => setOtpInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && otpInput.length >= 4) goAuth("phone_name", () => otpInput.length >= 4);
+              if (e.key === "Enter" && !authLoading && otpInput.length >= 4 && nameInput.trim()) finishRegistration();
             }}
             placeholder="••••"
-            className="otp-input w-full rounded-2xl px-4 py-3.5 text-center text-2xl outline-none mb-5 font-mono-data"
+            className="otp-input w-full rounded-2xl px-4 py-3.5 text-center text-2xl outline-none mb-3 font-mono-data"
             style={{ background: t.chip, color: t.textPrimary, border: `1px solid ${t.cardBorder}` }}
           />
-          <Button
-            variant="primary"
-            accent={activeBrand.primary}
-            size="lg"
-            className="w-full"
-            disabled={authLoading || otpInput.length < 4}
-            onClick={() => goAuth("phone_name", () => otpInput.length >= 4)}
-          >
-            {authLoading ? "Verifying…" : "Verify"}
-          </Button>
-        </AuthScreen>
-      )}
-
-      {/* ==================== AUTH: PHONE NAME (final step) ==================== */}
-      {step === "phone_name" && (
-        <AuthScreen
-          t={t}
-          themeMode={themeMode}
-          onBack={() => setStep("phone_otp")}
-          icon={<User size={22} style={{ color: activeBrand.primary }} />}
-          title="What's your name?"
-          subtitle="Last step. This is how we'll greet you."
-        >
           <input
             type="text"
-            autoFocus
+            autoFocus={false}
             value={nameInput}
             onChange={(e) => setNameInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && nameInput.trim()) finishRegistration();
+              if (e.key === "Enter" && !authLoading && otpInput.length >= 4 && nameInput.trim()) finishRegistration();
             }}
             placeholder="Full name"
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-5"
@@ -652,10 +726,10 @@ async function approve() {
             accent={activeBrand.primary}
             size="lg"
             className="w-full"
-            disabled={authLoading || !nameInput.trim()}
+            disabled={authLoading || otpInput.length < 4 || !nameInput.trim()}
             onClick={finishRegistration}
           >
-            {authLoading ? "Setting up…" : "Finish"}
+            {authLoading ? "Setting up…" : "Continue"}
           </Button>
         </AuthScreen>
       )}
@@ -677,7 +751,7 @@ async function approve() {
             value={emailInput}
             onChange={(e) => setEmailInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && emailInput.trim()) goAuth("email_otp", () => emailInput.trim().length > 0);
+              if (e.key === "Enter" && !authLoading && emailInput.trim()) goAuth("email_verify", () => emailInput.trim().length > 0);
             }}
             placeholder="you@example.com"
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-3"
@@ -689,7 +763,7 @@ async function approve() {
             value={emailPhoneInput}
             onChange={(e) => setEmailPhoneInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && emailInput.trim()) goAuth("email_otp", () => emailInput.trim().length > 0);
+              if (e.key === "Enter" && !authLoading && emailInput.trim()) goAuth("email_verify", () => emailInput.trim().length > 0);
             }}
             placeholder="Phone number (optional)"
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-5 font-mono-data"
@@ -701,22 +775,22 @@ async function approve() {
             size="lg"
             className="w-full"
             disabled={authLoading || !emailInput.trim()}
-            onClick={() => goAuth("email_otp", () => emailInput.trim().length > 0)}
+            onClick={() => goAuth("email_verify", () => emailInput.trim().length > 0)}
           >
             {authLoading ? "Sending code…" : "Send code"}
           </Button>
         </AuthScreen>
       )}
 
-      {/* ==================== AUTH: EMAIL OTP ==================== */}
-      {step === "email_otp" && (
+      {/* ==================== AUTH: EMAIL VERIFY (code + name combined) ==================== */}
+      {step === "email_verify" && (
         <AuthScreen
           t={t}
           themeMode={themeMode}
           onBack={() => setStep("email_input")}
           icon={<KeyRound size={22} style={{ color: activeBrand.primary }} />}
-          title="Enter the code"
-          subtitle={`We sent a 4-digit code to ${emailInput || "your email"}.`}
+          title="Almost there"
+          subtitle={`Enter the 4-digit code we sent to ${emailInput || "your email"}, and tell us your name.`}
         >
           <input
             type="text"
@@ -726,42 +800,18 @@ async function approve() {
             value={otpInput}
             onChange={(e) => setOtpInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && otpInput.length >= 4) goAuth("email_name", () => otpInput.length >= 4);
+              if (e.key === "Enter" && !authLoading && otpInput.length >= 4 && nameInput.trim()) finishRegistration();
             }}
             placeholder="••••"
-            className="otp-input w-full rounded-2xl px-4 py-3.5 text-center text-2xl outline-none mb-5 font-mono-data"
+            className="otp-input w-full rounded-2xl px-4 py-3.5 text-center text-2xl outline-none mb-3 font-mono-data"
             style={{ background: t.chip, color: t.textPrimary, border: `1px solid ${t.cardBorder}` }}
           />
-          <Button
-            variant="primary"
-            accent={activeBrand.primary}
-            size="lg"
-            className="w-full"
-            disabled={authLoading || otpInput.length < 4}
-            onClick={() => goAuth("email_name", () => otpInput.length >= 4)}
-          >
-            {authLoading ? "Verifying…" : "Verify"}
-          </Button>
-        </AuthScreen>
-      )}
-
-      {/* ==================== AUTH: EMAIL NAME (final step) ==================== */}
-      {step === "email_name" && (
-        <AuthScreen
-          t={t}
-          themeMode={themeMode}
-          onBack={() => setStep("email_otp")}
-          icon={<User size={22} style={{ color: activeBrand.primary }} />}
-          title="What's your name?"
-          subtitle="Last step. This is how we'll greet you."
-        >
           <input
             type="text"
-            autoFocus
             value={nameInput}
             onChange={(e) => setNameInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !authLoading && nameInput.trim()) finishRegistration();
+              if (e.key === "Enter" && !authLoading && otpInput.length >= 4 && nameInput.trim()) finishRegistration();
             }}
             placeholder="Full name"
             className="w-full rounded-2xl px-4 py-3.5 text-sm outline-none mb-5"
@@ -772,10 +822,10 @@ async function approve() {
             accent={activeBrand.primary}
             size="lg"
             className="w-full"
-            disabled={authLoading || !nameInput.trim()}
+            disabled={authLoading || otpInput.length < 4 || !nameInput.trim()}
             onClick={finishRegistration}
           >
-            {authLoading ? "Setting up…" : "Finish"}
+            {authLoading ? "Setting up…" : "Continue"}
           </Button>
         </AuthScreen>
       )}
@@ -784,7 +834,7 @@ async function approve() {
       {step === "home" && (
         <div className="flex-1 flex flex-col overflow-y-auto scroll-thin animate-fade-in-up relative">
           <div
-            className={`px-5 py-4 flex items-center justify-between sticky top-0 z-10 ${themeMode === "glass" ? "glass-active" : ""}`}
+            className={`px-5 py-4 flex items-center justify-between sticky top-0 z-50 ${themeMode === "glass" ? "glass-active" : ""}`}
             style={themeMode === "glass" ? {} : { backgroundColor: t.header, borderBottom: `1px solid ${t.headerBorder}` }}
           >
             <div className="flex items-center gap-2">
@@ -797,21 +847,6 @@ async function approve() {
             </div>
 
             <div className="flex items-center gap-2">
-              {/* LEADERBOARD BUTTON */}
-              <button
-                type="button"
-                onClick={() => {
-                  setAccountOpen(false);
-                  setNotifOpen(false);
-                  setStep("leaderboard");
-                }}
-                className="w-9 h-9 rounded-full flex items-center justify-center transition-colors duration-200 hover:opacity-80"
-                style={{ background: t.chip }}
-                aria-label="Leaderboard"
-              >
-                <Trophy size={14} style={{ color: t.textSecondary }} />
-              </button>
-
               {/* NOTIFICATION BUTTON */}
               <button
                 type="button"
@@ -881,34 +916,50 @@ async function approve() {
               </div>
             </div>
 
-            {/* LEADERBOARD TEASER CARD */}
+            {/* NEXT REWARD — a concrete, immediate goal instead of just an abstract tier */}
+            {nextReward && (
+              <div
+                className={`flex items-center gap-3 rounded-2xl px-4 py-3 mb-5 ${themeMode === "glass" ? "glass-active" : ""}`}
+                style={themeMode === "glass" ? {} : { background: t.cardBg, border: `1px solid ${t.cardBorder}` }}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs" style={{ color: t.textSecondary }}>
+                    <span className="font-bold" style={{ color: activeBrand.primary }}>{Math.max(0, nextReward.cost - points)} pts</span> away from
+                  </div>
+                  <div className="text-sm font-bold truncate" style={{ color: t.textPrimary }}>
+                    {nextReward.name}
+                  </div>
+                </div>
+                <div className="h-1.5 w-16 rounded-full overflow-hidden shrink-0" style={{ background: t.gridLine }}>
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: `${Math.min(100, Math.round((points / nextReward.cost) * 100))}%`,
+                      background: activeBrand.primary,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* PRIMARY ACTION — one big, thumb-reachable button for earning/redeeming */}
+            <div className="mb-4">
+              <Button variant="primary" accent={activeBrand.primary} size="lg" className="w-full shadow-soft-lg !py-4 !text-base" onClick={toggleQrMenu}>
+                <QrCode size={18} /> Earn or redeem points
+              </Button>
+            </div>
+
+            {/* Leaderboard — demoted to a small secondary link, not a full card */}
             <button
               type="button"
               onClick={() => setStep("leaderboard")}
-              className={`w-full flex items-center justify-between rounded-3xl px-5 py-4 mb-5 text-left transition-all duration-200 active:scale-[0.98] shadow-soft-lg ${themeMode === "glass" ? "glass-active" : ""}`}
-              style={themeMode === "glass" ? {} : { background: t.cardBg, border: `1px solid ${t.cardBorder}` }}
+              className="w-full flex items-center justify-center gap-1.5 text-xs font-medium mb-7 py-1.5 transition-opacity hover:opacity-70"
+              style={{ color: t.textSecondary }}
             >
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-full flex items-center justify-center shrink-0" style={{ background: "linear-gradient(135deg,#F5C518,#F0932B)" }}>
-                  <Trophy size={18} className="text-white" />
-                </div>
-                <div>
-                  <div className="text-sm font-bold" style={{ color: t.textPrimary }}>
-                    Leaderboard
-                  </div>
-                  <div className="text-xs mt-0.5" style={{ color: t.textSecondary }}>
-                    You&apos;re <span className="font-bold" style={{ color: activeBrand.primary }}>#{myEntry?.rank ?? "N/A"}</span> this month
-                  </div>
-                </div>
-              </div>
-              <ChevronRight size={16} style={{ color: t.textSecondary }} />
+              <Trophy size={12} />
+              You&apos;re #{myEntry?.rank ?? "N/A"} on the leaderboard this month
+              <ChevronRight size={12} />
             </button>
-
-            <div className="mb-7">
-              <Button variant="primary" accent={activeBrand.primary} size="lg" className="w-full shadow-soft-lg" onClick={toggleQrMenu}>
-                <QrCode size={16} /> QR Code
-              </Button>
-            </div>
 
             {scannerOpen && (
               <div
@@ -985,23 +1036,30 @@ async function approve() {
             <div className="grid grid-cols-1 gap-2.5 mb-7">
   {rewards.map((item) => {
     const canRedeem = points >= item.cost;
+    const shortfall = item.cost - points;
     const RewardIcon = ICONS[item.icon] || Coffee;
     return (
       <div
         key={item.id}
         className={`flex items-center justify-between rounded-2xl px-4 py-3.5 transition-colors duration-200 shadow-sm hover:shadow-md ${themeMode === "glass" ? "glass-active" : ""}`}
-        style={themeMode === "glass" ? {} : { background: t.cardBg, border: `1px solid ${t.cardBorder}` }}
+        style={{
+          opacity: canRedeem ? 1 : 0.55,
+          ...(themeMode === "glass" ? {} : { background: t.cardBg, border: `1px solid ${t.cardBorder}` }),
+        }}
       >
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-full flex items-center justify-center shrink-0" style={{ background: "linear-gradient(135deg,#F5C518,#F0932B)" }}>
-            <RewardIcon size={16} className="text-white" />
+          <div
+            className="w-9 h-9 rounded-full flex items-center justify-center shrink-0"
+            style={{ background: canRedeem ? "linear-gradient(135deg,#F5C518,#F0932B)" : t.chip }}
+          >
+            <RewardIcon size={16} className={canRedeem ? "text-white" : ""} style={canRedeem ? {} : { color: t.textSecondary }} />
           </div>
           <div>
             <div className="text-sm font-bold" style={{ color: t.textPrimary }}>
               {item.name}
             </div>
-            <div className="text-xs font-mono-data" style={{ color: activeBrand.primary }}>
-              {item.cost} pts
+            <div className="text-xs font-mono-data" style={{ color: canRedeem ? activeBrand.primary : t.textSecondary }}>
+              {canRedeem ? `${item.cost} pts` : `Need ${shortfall} more pts`}
             </div>
           </div>
         </div>
@@ -1012,7 +1070,7 @@ async function approve() {
           </Button>
         ) : (
           <Button variant="ghost" size="sm" disabled>
-            Redeem
+            Locked
           </Button>
         )}
       </div>
@@ -1182,6 +1240,16 @@ async function approve() {
       {/* NEW MENU PLACEMENT:
         Moving the menus OUT of the sticky header and putting them at the root level fixes the nested backdrop-filter bug. 
       */}
+      {step === "home" && (notifOpen || accountOpen) && (
+        <div
+          className="fixed inset-0 z-40"
+          onClick={() => {
+            setNotifOpen(false);
+            setAccountOpen(false);
+            setAppearanceOpen(false);
+          }}
+        />
+      )}
       {step === "home" && notifOpen && (
         <div
           className={`absolute right-5 top-16 w-64 rounded-3xl p-4 z-50 ios-dropdown ${themeMode === "glass" ? "glass-active" : ""}`}
@@ -1267,54 +1335,70 @@ async function approve() {
                 <span className="font-semibold" style={{ color: t.textPrimary }}>{customer.phone}</span>
               </div>
             )}
-            <div className="rounded-2xl px-3 py-2" style={{ background: t.chip }}>
-              <p className="text-xs" style={{ color: t.textSecondary }}>
-                Loyalty ID:
-              </p>
-              <p className="text-sm font-medium" style={{ color: t.textPrimary }}>
-                {customer.memberId}
-              </p>
-            </div>
-            <div className="rounded-2xl px-3 py-2" style={{ background: t.chip }}>
-              <p className="text-xs" style={{ color: t.textSecondary }}>
-                Loyalty since:
-              </p>
-              <p className="text-sm font-medium" style={{ color: t.textPrimary }}>
-                {customer.joined}
-              </p>
+            <div className="rounded-2xl px-3 py-2 flex items-center justify-between" style={{ background: t.chip }}>
+              <div>
+                <p className="text-xs" style={{ color: t.textSecondary }}>
+                  Loyalty ID
+                </p>
+                <p className="text-sm font-medium" style={{ color: t.textPrimary }}>
+                  {customer.memberId}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs" style={{ color: t.textSecondary }}>
+                  Member since
+                </p>
+                <p className="text-sm font-medium" style={{ color: t.textPrimary }}>
+                  {customer.joined}
+                </p>
+              </div>
             </div>
 
-            {/* 3-Way iOS Style Segmented Theme Control */}
-            <div className="pt-2">
-              <p className="text-xs mb-2 ml-1" style={{ color: t.textSecondary }}>
-                Mode
-              </p>
-              <div className="p-1 rounded-2xl flex gap-1 mb-2" style={{ background: t.chip }}>
-                <button
-                  onClick={() => setThemeMode("light")}
-                  className={`flex-1 py-1.5 flex justify-center items-center rounded-xl transition-all ${themeMode === "light" ? "glass-active" : ""}`}
-                  style={themeMode === "light" ? { color: t.textPrimary } : { color: t.textSecondary }}
-                  aria-label="Light Mode"
-                >
-                  <Sun size={14} />
-                </button>
-                <button
-                  onClick={() => setThemeMode("dark")}
-                  className={`flex-1 py-1.5 flex justify-center items-center rounded-xl transition-all ${themeMode === "dark" ? "glass-active" : ""}`}
-                  style={themeMode === "dark" ? { color: t.textPrimary } : { color: t.textSecondary }}
-                  aria-label="Dark Mode"
-                >
-                  <Moon size={14} />
-                </button>
-                <button
-                  onClick={() => setThemeMode("glass")}
-                  className={`flex-1 py-1.5 flex justify-center items-center rounded-xl transition-all ${themeMode === "glass" ? "glass-active" : ""}`}
-                  style={themeMode === "glass" ? { color: t.textPrimary } : { color: t.textSecondary }}
-                  aria-label="Liquid Glass"
-                >
-                  <Droplet size={14} />
-                </button>
-              </div>
+            {/* Appearance — tucked behind a collapsed row so it doesn't compete with account info */}
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={() => setAppearanceOpen((v) => !v)}
+                className="w-full flex items-center justify-between rounded-2xl px-3 py-2 transition-opacity hover:opacity-80"
+                style={{ background: t.chip }}
+              >
+                <span className="flex items-center gap-2 text-xs" style={{ color: t.textSecondary }}>
+                  {themeMode === "light" ? <Sun size={13} /> : themeMode === "dark" ? <Moon size={13} /> : <Droplet size={13} />}
+                  Appearance
+                </span>
+                <ChevronDown
+                  size={13}
+                  style={{ color: t.textSecondary, transform: appearanceOpen ? "rotate(180deg)" : "none", transition: "transform 200ms ease" }}
+                />
+              </button>
+              {appearanceOpen && (
+                <div className="p-1 rounded-2xl flex gap-1 mt-2" style={{ background: t.chip }}>
+                  <button
+                    onClick={() => setThemeMode("light")}
+                    className={`flex-1 py-1.5 flex justify-center items-center rounded-xl transition-all ${themeMode === "light" ? "glass-active" : ""}`}
+                    style={themeMode === "light" ? { color: t.textPrimary } : { color: t.textSecondary }}
+                    aria-label="Light Mode"
+                  >
+                    <Sun size={14} />
+                  </button>
+                  <button
+                    onClick={() => setThemeMode("dark")}
+                    className={`flex-1 py-1.5 flex justify-center items-center rounded-xl transition-all ${themeMode === "dark" ? "glass-active" : ""}`}
+                    style={themeMode === "dark" ? { color: t.textPrimary } : { color: t.textSecondary }}
+                    aria-label="Dark Mode"
+                  >
+                    <Moon size={14} />
+                  </button>
+                  <button
+                    onClick={() => setThemeMode("glass")}
+                    className={`flex-1 py-1.5 flex justify-center items-center rounded-xl transition-all ${themeMode === "glass" ? "glass-active" : ""}`}
+                    style={themeMode === "glass" ? { color: t.textPrimary } : { color: t.textSecondary }}
+                    aria-label="Liquid Glass"
+                  >
+                    <Droplet size={14} />
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1325,7 +1409,7 @@ async function approve() {
       )}
 
       {step === "verify" && (
-        <VerifyCode brand={activeBrand} mode={mode} reward={reward} onApprove={approve} onBack={() => setStep("home")} />
+        <VerifyCode brand={activeBrand} mode={mode} reward={reward} code={pendingCode} onCancel={cancelVerify} />
       )}
 
       {step === "approved" && (
